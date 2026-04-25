@@ -1,5 +1,7 @@
 const AppError = require("../utils/AppError");
 
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
 const notFoundHandler = (req, res, next) => {
   next(new AppError(`Route not found: ${req.method} ${req.originalUrl}`, 404));
 };
@@ -21,6 +23,11 @@ const errorHandler = (error, req, res, next) => {
       ? error.message
       : "Internal Server Error",
   };
+
+  if (IS_PRODUCTION && statusCode >= 500) {
+    payload.error_code = error.code || "ERR_INTERNAL";
+    payload.timestamp = new Date().toISOString();
+  }
 
   res.status(statusCode).json(payload);
 };

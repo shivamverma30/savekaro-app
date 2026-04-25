@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 const ytDlp = require("yt-dlp-exec");
 
@@ -10,6 +11,53 @@ const TEMP_DIR = path.join(__dirname, "..", "temp");
 const DEFAULT_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const IS_WINDOWS = process.platform === "win32";
+
+const productionLog = (...args) => {
+  if (IS_PRODUCTION) {
+    console.log("[yt-dlp]", ...args);
+  }
+};
+
+const productionError = (...args) => {
+  if (IS_PRODUCTION) {
+    console.error("[yt-dlp-error]", ...args);
+  }
+};
+
+const resolveYtDlpBinary = () => {
+  try {
+    if (IS_WINDOWS) {
+      return null;
+    }
+
+    const candidates = [
+      path.join(__dirname, "..", "..", "node_modules", "yt-dlp", "dist", "yt-dlp"),
+      path.join(__dirname, "..", "..", "node_modules", ".bin", "yt-dlp"),
+      "/usr/local/bin/yt-dlp",
+      "/usr/bin/yt-dlp",
+      path.resolve(process.env.YT_DLP_PATH || ""),
+    ].filter(Boolean);
+
+    for (const binaryPath of candidates) {
+      try {
+        execSync(`test -x "${binaryPath}"`, { stdio: "ignore" });
+        productionLog(`Found yt-dlp binary at: ${binaryPath}`);
+        return binaryPath;
+      } catch {
+        continue;
+      }
+    }
+
+    productionError("yt-dlp binary not found in any candidate path");
+    return null;
+  } catch (err) {
+    productionError("Error resolving yt-dlp binary:", err.message);
+    return null;
+  }
+};
 
 const ensureTempDir = async () => {
   await fs.promises.mkdir(TEMP_DIR, { recursive: true });
@@ -69,8 +117,6 @@ const detectPlatform = (url) => {
 
   return "generic";
 };
-
-const isWindowsRuntime = process.platform === "win32";
 
 const isSslCertError = (message) => {
   return /ssl certificate_verify_failed|certificate verify failed|unable to get local issuer certificate|self signed certificate/i.test(
@@ -204,20 +250,38 @@ const parseYtDlpJson = (data) => {
 };
 
 const runYtDlpRaw = async (url, options) => {
-  return ytDlp(url, {
+  const binaryPath = resolveYtDlpBinary();
+  const baseOptions = {
     noWarnings: true,
     noPlaylist: true,
     preferFreeFormats: true,
     mergeOutputFormat: "mp4",
-    socketTimeout: 30,
+    socketTimeout: 45,
     retries: 3,
     ...options,
-  });
+  };
+
+  if (binaryPath && !IS_WINDOWS) {
+    baseOptions.exec = binaryPath;
+  }
+
+  try {
+    productionLog("Calling yt-dlp with options:", {
+      url: url.substring(0, 50) + "...",
+      timeout: baseOptions.socketTimeout,
+      binary: binaryPath || "default",
+    });
+    return await ytDlp(url, baseOptions);
+  } catch (error) {
+    productionError("yt-dlp raw call failed:", error.message);
+    throw error;
+  }
 };
 
 const runYtDlp = async (url, options, platform) => {
   let temporaryRetried = false;
   let sslRetried = false;
+  let extractRetried = false;
 
   try {
     while (true) {
@@ -232,16 +296,30 @@ const runYtDlp = async (url, options, platform) => {
           .trim();
 
         if (!temporaryRetried && isTemporaryExtractorFailure(errorMessage)) {
+          productionLog("Temporary extraction failure, retrying...", errorMessage.substring(0, 100));
           temporaryRetried = true;
           continue;
         }
 
-        if (!sslRetried && isWindowsRuntime && isSslCertError(errorMessage)) {
+        if (!extractRetried && !IS_WINDOWS && isTemporaryExtractorFailure(errorMessage)) {
+          productionLog("Linux/production extraction retry (2nd attempt)...");
+          extractRetried = true;
+          continue;
+        }
+
+        if (!sslRetried && IS_WINDOWS && isSslCertError(errorMessage)) {
+          productionLog("SSL certificate error on Windows, retrying without verification...");
           sslRetried = true;
           continue;
         }
 
-        throw createFriendlyDownloadError(errorMessage, platform);
+        const friendlyError = createFriendlyDownloadError(errorMessage, platform);
+        productionError("Final error after retries:", {
+          message: friendlyError.message,
+          statusCode: friendlyError.statusCode,
+          originalMessage: errorMessage.substring(0, 150),
+        });
+        throw friendlyError;
       }
     }
   } catch (error) {
@@ -252,7 +330,13 @@ const runYtDlp = async (url, options, platform) => {
     const errorMessage = (error?.stderr || error?.message || "yt-dlp command failed")
       .toString()
       .trim();
-    throw createFriendlyDownloadError(errorMessage, platform);
+    
+    const friendlyError = createFriendlyDownloadError(errorMessage, platform);
+    productionError("Unhandled error:", {
+      message: friendlyError.message,
+      statusCode: friendlyError.statusCode,
+    });
+    throw friendlyError;
   }
 };
 
