@@ -339,23 +339,27 @@ const getFallbackCommands = async () => {
     return [];
   }
 
-  await resolveLocalYtDlpBinary();
+  const localBinary = await resolveLocalYtDlpBinary();
 
   return [
+    ...(localBinary
+      ? [
+          {
+            label: "local yt-dlp-exec binary",
+            command: localBinary,
+            args: [],
+          },
+        ]
+      : []),
     {
-      label: "npx yt-dlp",
-      command: process.platform === "win32" ? "npx.cmd" : "npx",
-      args: ["--yes", "yt-dlp"],
+      label: "yt-dlp from PATH",
+      command: "yt-dlp",
+      args: [],
     },
     {
       label: "python3 -m yt_dlp",
       command: "python3",
       args: ["-m", "yt_dlp"],
-    },
-    {
-      label: "yt-dlp from PATH",
-      command: "yt-dlp",
-      args: [],
     },
   ];
 };
