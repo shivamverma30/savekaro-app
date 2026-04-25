@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFile } = require("child_process");
 
 const ytDlp = require("yt-dlp-exec");
 
@@ -14,6 +14,14 @@ const DEFAULT_USER_AGENT =
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 const IS_WINDOWS = process.platform === "win32";
+const IS_RENDER = Boolean(
+  process.env.RENDER ||
+    process.env.RENDER_SERVICE_ID ||
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.RENDER_EXTERNAL_HOSTNAME ||
+    process.env.RENDER_INSTANCE_ID
+);
+const IS_LINUX_HOSTED = process.platform === "linux" || IS_RENDER;
 
 const productionLog = (...args) => {
   if (IS_PRODUCTION) {
@@ -27,36 +35,75 @@ const productionError = (...args) => {
   }
 };
 
-const resolveYtDlpBinary = () => {
+const ensureExecutablePermission = async (filePath) => {
+  if (!filePath || IS_WINDOWS) {
+    return false;
+  }
+
   try {
-    if (IS_WINDOWS) {
-      return null;
+    const stats = await fs.promises.stat(filePath);
+
+    if ((stats.mode & 0o111) === 0) {
+      await fs.promises.chmod(filePath, 0o755);
+      productionLog(`Set executable permission on local yt-dlp binary: ${filePath}`);
     }
 
-    const candidates = [
-      path.join(__dirname, "..", "..", "node_modules", "yt-dlp", "dist", "yt-dlp"),
-      path.join(__dirname, "..", "..", "node_modules", ".bin", "yt-dlp"),
-      "/usr/local/bin/yt-dlp",
-      "/usr/bin/yt-dlp",
-      path.resolve(process.env.YT_DLP_PATH || ""),
-    ].filter(Boolean);
+    return true;
+  } catch (error) {
+    productionLog(`Could not ensure executable permission for ${filePath}: ${error.message}`);
+    return null;
+  }
+};
 
-    for (const binaryPath of candidates) {
+const resolveLocalYtDlpBinary = async () => {
+  if (IS_WINDOWS) {
+    return null;
+  }
+
+  try {
+    const packageJsonPath = require.resolve("yt-dlp-exec/package.json");
+    const packageRoot = path.dirname(packageJsonPath);
+    const candidates = [
+      path.join(packageRoot, "bin", "yt-dlp"),
+      path.join(packageRoot, "dist", "yt-dlp"),
+      path.join(packageRoot, ".bin", "yt-dlp"),
+    ];
+
+    for (const candidatePath of candidates) {
       try {
-        execSync(`test -x "${binaryPath}"`, { stdio: "ignore" });
-        productionLog(`Found yt-dlp binary at: ${binaryPath}`);
-        return binaryPath;
+        await fs.promises.access(candidatePath, fs.constants.F_OK);
+        await ensureExecutablePermission(candidatePath);
+        productionLog(`Local yt-dlp binary detected: ${candidatePath}`);
+        return candidatePath;
       } catch {
         continue;
       }
     }
-
-    productionError("yt-dlp binary not found in any candidate path");
-    return null;
-  } catch (err) {
-    productionError("Error resolving yt-dlp binary:", err.message);
-    return null;
+  } catch (error) {
+    productionLog(`Local yt-dlp binary lookup skipped: ${error.message}`);
   }
+
+  return null;
+};
+
+const execFileAsync = (command, args, options = {}) => {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { maxBuffer: 10 * 1024 * 1024, windowsHide: true, ...options },
+      (error, stdout, stderr) => {
+        if (error) {
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+          return;
+        }
+
+        resolve({ stdout, stderr });
+      }
+    );
+  });
 };
 
 const ensureTempDir = async () => {
@@ -249,8 +296,124 @@ const parseYtDlpJson = (data) => {
   return data;
 };
 
+const buildCommonCliArgs = (options = {}) => {
+  const args = [
+    "--no-warnings",
+    "--no-playlist",
+    "--prefer-free-formats",
+    "--merge-output-format",
+    "mp4",
+    "--socket-timeout",
+    "45",
+    "--retries",
+    "3",
+  ];
+
+  if (options.userAgent) {
+    args.push("--user-agent", options.userAgent);
+  }
+
+  if (options.referer) {
+    args.push("--referer", options.referer);
+  }
+
+  if (Array.isArray(options.addHeader)) {
+    for (const header of options.addHeader) {
+      args.push("--add-header", header);
+    }
+  }
+
+  if (options.cookies) {
+    args.push("--cookies", options.cookies);
+  }
+
+  if (options.noCheckCertificates) {
+    args.push("--no-check-certificates");
+  }
+
+  return args;
+};
+
+const getFallbackCommands = async () => {
+  if (!IS_LINUX_HOSTED) {
+    return [];
+  }
+
+  await resolveLocalYtDlpBinary();
+
+  return [
+    {
+      label: "npx yt-dlp",
+      command: process.platform === "win32" ? "npx.cmd" : "npx",
+      args: ["--yes", "yt-dlp"],
+    },
+    {
+      label: "python3 -m yt_dlp",
+      command: "python3",
+      args: ["-m", "yt_dlp"],
+    },
+    {
+      label: "yt-dlp from PATH",
+      command: "yt-dlp",
+      args: [],
+    },
+  ];
+};
+
+const runCliCommand = async ({ command, args, url, options, mode }) => {
+  const cliArgs = [
+    ...args,
+    ...buildCommonCliArgs(options),
+    ...(mode === "extract" ? ["--dump-single-json", "--skip-download"] : []),
+    ...(mode === "download"
+      ? ["-f", options.format, "-o", options.output, "--restrict-filenames", "--force-overwrites"]
+      : []),
+    url,
+  ].filter(Boolean);
+
+  productionLog(`Trying fallback command: ${command}`, cliArgs.slice(0, 12));
+  return execFileAsync(command, cliArgs);
+};
+
+const isEnoentError = (error) => {
+  return String(error?.code || "").toUpperCase() === "ENOENT" || /ENOENT/i.test(String(error?.message || ""));
+};
+
+const normalizeCommandError = (error) => {
+  const stderr = String(error?.stderr || "").trim();
+  const stdout = String(error?.stdout || "").trim();
+  return (stderr || stdout || error?.message || "yt-dlp command failed").toString().trim();
+};
+
+const runFallbacks = async ({ url, options, platform, mode }) => {
+  const fallbacks = await getFallbackCommands();
+
+  for (const fallback of fallbacks) {
+    try {
+      const result = await runCliCommand({
+        command: fallback.command,
+        args: fallback.args,
+        url,
+        options,
+        mode,
+      });
+
+      productionLog(`Fallback succeeded: ${fallback.label}`);
+      return mode === "extract" ? result.stdout : result;
+    } catch (error) {
+      const errorMessage = normalizeCommandError(error);
+      productionError(`Fallback failed: ${fallback.label}`, errorMessage.substring(0, 200));
+
+      if (!isEnoentError(error) && !/not found|command not found|spawn/i.test(errorMessage)) {
+        throw createFriendlyDownloadError(errorMessage, platform);
+      }
+    }
+  }
+
+  throw new AppError("Unable to locate a working yt-dlp executable on this server.", 503);
+};
+
 const runYtDlpRaw = async (url, options) => {
-  const binaryPath = resolveYtDlpBinary();
   const baseOptions = {
     noWarnings: true,
     noPlaylist: true,
@@ -261,55 +424,61 @@ const runYtDlpRaw = async (url, options) => {
     ...options,
   };
 
-  if (binaryPath && !IS_WINDOWS) {
-    baseOptions.exec = binaryPath;
-  }
+  productionLog("Calling yt-dlp default invocation:", {
+    url: url.substring(0, 50) + "...",
+    timeout: baseOptions.socketTimeout,
+    render: IS_RENDER,
+  });
 
-  try {
-    productionLog("Calling yt-dlp with options:", {
-      url: url.substring(0, 50) + "...",
-      timeout: baseOptions.socketTimeout,
-      binary: binaryPath || "default",
-    });
-    return await ytDlp(url, baseOptions);
-  } catch (error) {
-    productionError("yt-dlp raw call failed:", error.message);
-    throw error;
-  }
+  return ytDlp(url, baseOptions);
 };
 
 const runYtDlp = async (url, options, platform) => {
   let temporaryRetried = false;
   let sslRetried = false;
   let extractRetried = false;
+  const isExtractMode = Boolean(options.dumpSingleJson);
 
   try {
     while (true) {
       try {
         return await runYtDlpRaw(url, {
           ...options,
-          ...(sslRetried ? { noCheckCertificates: true } : {}),
         });
       } catch (error) {
         const errorMessage = (error?.stderr || error?.message || "yt-dlp command failed")
           .toString()
           .trim();
 
-        if (!temporaryRetried && isTemporaryExtractorFailure(errorMessage)) {
-          productionLog("Temporary extraction failure, retrying...", errorMessage.substring(0, 100));
-          temporaryRetried = true;
-          continue;
+        if (IS_WINDOWS) {
+          if (!sslRetried && isSslCertError(errorMessage)) {
+            sslRetried = true;
+            productionLog("SSL certificate error on Windows, retrying without verification...");
+            continue;
+          }
+
+          throw createFriendlyDownloadError(errorMessage, platform);
         }
 
-        if (!extractRetried && !IS_WINDOWS && isTemporaryExtractorFailure(errorMessage)) {
-          productionLog("Linux/production extraction retry (2nd attempt)...");
+        if (isEnoentError(error) || /spawn .*ENOENT/i.test(errorMessage)) {
+          productionLog("Default invocation failed with ENOENT, trying fallbacks");
+          return runFallbacks({
+            url,
+            options,
+            platform,
+            mode: isExtractMode ? "extract" : "download",
+          });
+        }
+
+        if (isExtractMode && IS_LINUX_HOSTED && !extractRetried) {
           extractRetried = true;
+          productionLog("Retrying extract once on Linux/Render", errorMessage.substring(0, 100));
           continue;
         }
 
-        if (!sslRetried && IS_WINDOWS && isSslCertError(errorMessage)) {
-          productionLog("SSL certificate error on Windows, retrying without verification...");
-          sslRetried = true;
+        if (!temporaryRetried && isTemporaryExtractorFailure(errorMessage)) {
+          temporaryRetried = true;
+          productionLog("Temporary extraction failure, retrying...", errorMessage.substring(0, 100));
           continue;
         }
 
@@ -330,7 +499,7 @@ const runYtDlp = async (url, options, platform) => {
     const errorMessage = (error?.stderr || error?.message || "yt-dlp command failed")
       .toString()
       .trim();
-    
+
     const friendlyError = createFriendlyDownloadError(errorMessage, platform);
     productionError("Unhandled error:", {
       message: friendlyError.message,
