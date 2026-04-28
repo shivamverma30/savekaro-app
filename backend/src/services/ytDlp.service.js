@@ -23,14 +23,14 @@ const IS_RENDER = Boolean(
 );
 const IS_LINUX_HOSTED = process.platform === "linux" || IS_RENDER;
 
-const productionLog = (...args) => {
-  if (IS_PRODUCTION) {
+const devLog = (...args) => {
+  if (!IS_PRODUCTION) {
     console.log("[yt-dlp]", ...args);
   }
 };
 
-const productionError = (...args) => {
-  if (IS_PRODUCTION) {
+const devError = (...args) => {
+  if (!IS_PRODUCTION) {
     console.error("[yt-dlp-error]", ...args);
   }
 };
@@ -45,12 +45,12 @@ const ensureExecutablePermission = async (filePath) => {
 
     if ((stats.mode & 0o111) === 0) {
       await fs.promises.chmod(filePath, 0o755);
-      productionLog(`Set executable permission on local yt-dlp binary: ${filePath}`);
+      devLog(`Set executable permission on local yt-dlp binary: ${filePath}`);
     }
 
     return true;
   } catch (error) {
-    productionLog(`Could not ensure executable permission for ${filePath}: ${error.message}`);
+    devLog(`Could not ensure executable permission for ${filePath}: ${error.message}`);
     return null;
   }
 };
@@ -73,14 +73,14 @@ const resolveLocalYtDlpBinary = async () => {
       try {
         await fs.promises.access(candidatePath, fs.constants.F_OK);
         await ensureExecutablePermission(candidatePath);
-        productionLog(`Local yt-dlp binary detected: ${candidatePath}`);
+        devLog(`Local yt-dlp binary detected: ${candidatePath}`);
         return candidatePath;
       } catch {
         continue;
       }
     }
   } catch (error) {
-    productionLog(`Local yt-dlp binary lookup skipped: ${error.message}`);
+    devLog(`Local yt-dlp binary lookup skipped: ${error.message}`);
   }
 
   return null;
@@ -106,6 +106,35 @@ const execFileAsync = (command, args, options = {}) => {
   });
 };
 
+const fileExists = async (filePath) => {
+  try {
+    const stats = await fs.promises.stat(filePath);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+};
+
+const resolveFirstAvailablePath = async (candidates) => {
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+
+    const normalizedCandidate = String(candidate).trim();
+
+    if (!normalizedCandidate) {
+      continue;
+    }
+
+    if (await fileExists(normalizedCandidate)) {
+      return normalizedCandidate;
+    }
+  }
+
+  return null;
+};
+
 const ensureTempDir = async () => {
   await fs.promises.mkdir(TEMP_DIR, { recursive: true });
 };
@@ -121,14 +150,42 @@ const sanitizeNamePart = (value, fallback = "file") => {
   return sanitized || fallback;
 };
 
-const sanitizeExtension = (value) => {
-  const ext = String(value || "")
-    .trim()
-    .replace(/^\.+/, "")
-    .replace(/[^a-z0-9]+/gi, "")
-    .toLowerCase();
+const resolveFfmpegLocation = async () => {
+  const directCandidates = [
+    process.env.FFMPEG_PATH,
+    process.env.FFMPEG_LOCATION,
+    process.env.FFMPEG_BINARY,
+    ...(IS_WINDOWS
+      ? [
+          "C:\\ffmpeg\\bin\\ffmpeg.exe",
+          "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+          "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
+          "C:\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+        ]
+      : ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]),
+  ];
 
-  return ext || "mp4";
+  const directPath = await resolveFirstAvailablePath(directCandidates);
+
+  if (directPath) {
+    return directPath;
+  }
+
+  try {
+    const { stdout } = await execFileAsync(IS_WINDOWS ? "where" : "which", ["ffmpeg"]);
+    const fromPath = String(stdout || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+
+    if (fromPath && (await fileExists(fromPath))) {
+      return fromPath;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 };
 
 const detectPlatform = (url) => {
@@ -309,6 +366,10 @@ const buildCommonCliArgs = (options = {}) => {
     "3",
   ];
 
+  if (options.ffmpegLocation) {
+    args.push("--ffmpeg-location", options.ffmpegLocation);
+  }
+
   if (options.userAgent) {
     args.push("--user-agent", options.userAgent);
   }
@@ -375,7 +436,7 @@ const runCliCommand = async ({ command, args, url, options, mode }) => {
     url,
   ].filter(Boolean);
 
-  productionLog(`Trying fallback command: ${command}`, cliArgs.slice(0, 12));
+  devLog(`Trying fallback command: ${command}`, cliArgs.slice(0, 12));
   return execFileAsync(command, cliArgs);
 };
 
@@ -402,11 +463,11 @@ const runFallbacks = async ({ url, options, platform, mode }) => {
         mode,
       });
 
-      productionLog(`Fallback succeeded: ${fallback.label}`);
+      devLog(`Fallback succeeded: ${fallback.label}`);
       return mode === "extract" ? result.stdout : result;
     } catch (error) {
       const errorMessage = normalizeCommandError(error);
-      productionError(`Fallback failed: ${fallback.label}`, errorMessage.substring(0, 200));
+      devError(`Fallback failed: ${fallback.label}`, errorMessage.substring(0, 200));
 
       if (!isEnoentError(error) && !/not found|command not found|spawn/i.test(errorMessage)) {
         throw createFriendlyDownloadError(errorMessage, platform);
@@ -428,7 +489,7 @@ const runYtDlpRaw = async (url, options) => {
     ...options,
   };
 
-  productionLog("Calling yt-dlp default invocation:", {
+  devLog("Calling yt-dlp default invocation:", {
     url: url.substring(0, 50) + "...",
     timeout: baseOptions.socketTimeout,
     render: IS_RENDER,
@@ -457,7 +518,7 @@ const runYtDlp = async (url, options, platform) => {
         if (IS_WINDOWS) {
           if (!sslRetried && isSslCertError(errorMessage)) {
             sslRetried = true;
-            productionLog("SSL certificate error on Windows, retrying without verification...");
+            devLog("SSL certificate error on Windows, retrying without verification...");
             continue;
           }
 
@@ -465,7 +526,7 @@ const runYtDlp = async (url, options, platform) => {
         }
 
         if (isEnoentError(error) || /spawn .*ENOENT/i.test(errorMessage)) {
-          productionLog("Default invocation failed with ENOENT, trying fallbacks");
+          devLog("Default invocation failed with ENOENT, trying fallbacks");
           return runFallbacks({
             url,
             options,
@@ -476,18 +537,18 @@ const runYtDlp = async (url, options, platform) => {
 
         if (isExtractMode && IS_LINUX_HOSTED && !extractRetried) {
           extractRetried = true;
-          productionLog("Retrying extract once on Linux/Render", errorMessage.substring(0, 100));
+          devLog("Retrying extract once on Linux/Render", errorMessage.substring(0, 100));
           continue;
         }
 
         if (!temporaryRetried && isTemporaryExtractorFailure(errorMessage)) {
           temporaryRetried = true;
-          productionLog("Temporary extraction failure, retrying...", errorMessage.substring(0, 100));
+          devLog("Temporary extraction failure, retrying...", errorMessage.substring(0, 100));
           continue;
         }
 
         const friendlyError = createFriendlyDownloadError(errorMessage, platform);
-        productionError("Final error after retries:", {
+        devError("Final error after retries:", {
           message: friendlyError.message,
           statusCode: friendlyError.statusCode,
           originalMessage: errorMessage.substring(0, 150),
@@ -505,7 +566,7 @@ const runYtDlp = async (url, options, platform) => {
       .trim();
 
     const friendlyError = createFriendlyDownloadError(errorMessage, platform);
-    productionError("Unhandled error:", {
+    devError("Unhandled error:", {
       message: friendlyError.message,
       statusCode: friendlyError.statusCode,
     });
@@ -553,6 +614,10 @@ const mapFormat = (format) => ({
   quality: buildQuality(format),
   resolution: buildResolution(format),
   filesize: format.filesize || format.filesize_approx || null,
+  vcodec: String(format.vcodec || "none"),
+  acodec: String(format.acodec || "none"),
+  hasVideo: format.vcodec !== "none",
+  hasAudio: format.acodec !== "none",
 });
 
 const sortFormats = (formats) => {
@@ -597,6 +662,31 @@ const normalizeInfo = (info) => {
     extractor: entry?.extractor || null,
     formats: mappedFormats,
   };
+};
+
+const getDownloadFormatSelector = (metadata, formatId, hasffmpeg) => {
+  const selectedFormatId = String(formatId || "").trim();
+  const selectedFormat = Array.isArray(metadata?.formats)
+    ? metadata.formats.find((format) => format.format_id === selectedFormatId)
+    : null;
+
+  if (selectedFormat?.hasVideo && selectedFormat?.hasAudio) {
+    return selectedFormatId;
+  }
+
+  if (selectedFormat?.hasVideo && !selectedFormat?.hasAudio) {
+    if (hasffmpeg) {
+      return `${selectedFormatId}+bestaudio/best`;
+    } else {
+      return "best";
+    }
+  }
+
+  if (hasffmpeg) {
+    return "bestvideo+bestaudio/best";
+  } else {
+    return "best";
+  }
 };
 
 const extractVideoData = async (url) => {
@@ -679,20 +769,28 @@ const downloadByFormat = async ({ url, formatId }) => {
 
   const metadata = await extractVideoData(url);
   const requestOptions = await buildRequestOptions(url);
+  const ffmpegLocation = await resolveFfmpegLocation();
+
   const downloadTitle = sanitizeNamePart(metadata.title, "video");
   const token = crypto.randomBytes(4).toString("hex");
   const safeFormat = sanitizeNamePart(formatId, "format");
   const filenamePrefix = `${downloadTitle}-${safeFormat}-${token}`;
   const outputTemplate = path.join(TEMP_DIR, `${filenamePrefix}.%(ext)s`);
+  const downloadFormat = getDownloadFormatSelector(metadata, formatId, Boolean(ffmpegLocation));
 
   const downloadOptions = {
-    format: formatId,
+    format: downloadFormat,
     output: outputTemplate,
     noPlaylist: true,
     restrictFilenames: true,
     forceOverwrites: true,
+    mergeOutputFormat: "mp4",
     ...requestOptions.options,
   };
+
+  if (ffmpegLocation) {
+    downloadOptions.ffmpegLocation = ffmpegLocation;
+  }
 
   await runYtDlp(url, downloadOptions, requestOptions.platform);
 
@@ -702,8 +800,7 @@ const downloadByFormat = async ({ url, formatId }) => {
     throw new AppError("Downloaded file was not found in temp storage.", 500);
   }
 
-  const downloadedExtension = sanitizeExtension(path.extname(downloadedFile.absolutePath));
-  const finalFileName = `${downloadTitle} - SV Downloader.${downloadedExtension}`;
+  const finalFileName = `${downloadTitle} - SV Downloader.mp4`;
 
   return {
     filePath: downloadedFile.absolutePath,
